@@ -1,0 +1,2 @@
+https://github.com/monkeyboard/Wiegand-Protocol-Library-for-Arduino
+https://github.com/bblanchon/ArduinoJson

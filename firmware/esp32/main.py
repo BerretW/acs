@@ -31,6 +31,17 @@ CONFIG = {
             "rex_pin": 22,
             "contact_pin": 23
         },
+        {
+            "id": 2,
+            "name": "Dilna - vchod",
+            "d0_pin": 33,
+            "d1_pin": 32,
+            "gled_pin": 18,
+            "rled_pin": 19,
+            "buzz_pin": 21,
+            "rex_pin": 22,
+            "contact_pin": 23
+        },
     ]
 }
 
@@ -85,7 +96,7 @@ async def command_listener(reader):
         try:
             line_str = raw_line.decode('utf-8')
             parsed_data = protocol.parse_message(line_str)
-        except (UnicodeError, ujson.JSONDecodeError):
+        except (UnicodeError, ValueError):
             print(f"Přijata poškozená zpráva: {raw_line.strip()}")
             continue
 
@@ -97,7 +108,17 @@ async def command_listener(reader):
             continue
         
         if parsed_data.get('type') == 'command':
-            uasyncio.create_task(handle_feedback_command(parsed_data))
+            if parsed_data.get('cmd') == 'identify':
+                ident_payload = {
+                    "type": "esp32",
+                    "hub_addr": CONFIG["HUB_ADDRESS"],
+                    "readers": len(CONFIG["DOORS"])
+                }
+                ident_msg = protocol.create_message(ident_payload)
+                if ident_msg:
+                    message_queue.append(ident_msg)
+            else:
+                uasyncio.create_task(handle_feedback_command(parsed_data))
 
 async def handle_feedback_command(cmd_data):
     """Zpracuje příkaz pro signalizaci na čtečce (grant/deny)."""

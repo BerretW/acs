@@ -2,7 +2,7 @@
 """
 Testovací skript pro PC, který simuluje Master ACS jednotku.
 - Naslouchá na sériovém portu na zprávy ze Slave modulu.
-- Umožňuje interaktivně odesílat příkazy (grant/deny).
+- Umožňuje interaktivně odesílat příkazy (grant/deny/identify).
 - Ověřuje funkčnost protokolu a Slave firmwaru.
 """
 
@@ -12,7 +12,6 @@ import serial_asyncio
 import sys
 
 # --- KONFIGURACE ---
-# !!! ZMĚŇTE PODLE VAŠEHO SYSTÉMU !!!
 SERIAL_PORT = "COM5"  # Windows: "COM3", "COM4", atd. | Linux: "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
@@ -25,7 +24,7 @@ class Colors:
     CYAN = '\033[96m'
     ENDC = '\033[0m'
 
-# --- PROTOKOLOVÉ FUNKCE (zkopírováno z designu) ---
+# --- PROTOKOLOVÉ FUNKCE ---
 
 def calculate_checksum(payload_str):
     """Vypočítá 8-bit XOR checksum."""
@@ -62,7 +61,6 @@ def parse_message(raw_line_str):
     except Exception:
         return None
 
-
 # --- ASYNCHRONNÍ ÚLOHY ---
 
 async def reader_task(reader):
@@ -81,11 +79,10 @@ async def reader_task(reader):
                 print(f"{Colors.RED}Přijata nečitelná zpráva: {line_str}{Colors.ENDC}")
                 continue
 
-            # Formátovaný výpis podle typu zprávy
             msg_type = data.get("type")
             hub = data.get("hub_addr")
             rdr = data.get("rdr_id")
-            
+
             print(f"{Colors.GREEN}IN <---", end=" ")
             if msg_type == "card_read":
                 print(f"CARD_READ | Hub:{hub} | Čtečka:{rdr} | Karta:{data.get('card')} | Bity:{data.get('bits')}{Colors.ENDC}")
@@ -95,13 +92,14 @@ async def reader_task(reader):
                 print(f"DOOR_CONTACT | Hub:{hub} | Dveře:{rdr} | Stav: {data.get('state').upper()}{Colors.ENDC}")
             elif msg_type == "heartbeat":
                 print(f"HEARTBEAT | Hub:{hub} | Modul je online.{Colors.ENDC}")
+            elif msg_type in ["nano", "esp32", "rp2040"]:
+                print(f"IDENTIFY | Typ: {msg_type.upper()} | Čteček: {data.get('readers')} | Hub:{hub} | Čtečka:{rdr}{Colors.ENDC}")
             else:
                 print(f"{Colors.YELLOW}Neznámý typ zprávy: {data}{Colors.ENDC}")
 
         except Exception as e:
             print(f"{Colors.RED}Chyba v reader tasku: {e}{Colors.ENDC}")
             await asyncio.sleep(1)
-
 
 async def interactive_writer_task(writer):
     """Umožňuje uživateli interaktivně posílat příkazy."""
@@ -111,31 +109,36 @@ async def interactive_writer_task(writer):
         print("\n" + Colors.BLUE + "Dostupné příkazy:" + Colors.ENDC)
         print(" [1] Povolit přístup (grant)")
         print(" [2] Zamítnout přístup (deny)")
+        print(" [3] Identifikovat zařízení (identify)")
         print(" [q] Ukončit")
-        
-        # Použijeme to_thread pro neblokující čekání na vstup
+
         choice = await loop.run_in_executor(None, sys.stdin.readline)
         choice = choice.strip()
 
         if choice == 'q':
             break
 
-        if choice in ['1', '2']:
+        if choice in ['1', '2', '3']:
             try:
                 hub_addr_str = await loop.run_in_executor(None, lambda: input("  Zadej adresu HUBu (např. 1): "))
                 rdr_id_str = await loop.run_in_executor(None, lambda: input("  Zadej ID dveří/čtečky (např. 1): "))
                 hub_addr = int(hub_addr_str)
                 rdr_id = int(rdr_id_str)
-                
-                cmd = "feedback_grant" if choice == '1' else "feedback_deny"
-                
+
+                if choice == '1':
+                    cmd = "feedback_grant"
+                elif choice == '2':
+                    cmd = "feedback_deny"
+                elif choice == '3':
+                    cmd = "identify"
+
                 payload = {
                     "type": "command",
                     "hub_addr": hub_addr,
                     "cmd": cmd,
                     "rdr_id": rdr_id
                 }
-                
+
                 message = create_message(payload)
                 if message:
                     print(f"{Colors.YELLOW}OUT ---> Posílám: {message.strip()}{Colors.ENDC}")
@@ -149,20 +152,15 @@ async def interactive_writer_task(writer):
         else:
             print(f"{Colors.RED}Neznámá volba.{Colors.ENDC}")
     
-    # Ukončení hlavního programu
     asyncio.get_event_loop().stop()
-
 
 async def main():
     """Hlavní funkce, která spustí oba tasky."""
     try:
         reader, writer = await serial_asyncio.open_serial_connection(url=SERIAL_PORT, baudrate=BAUD_RATE)
-        
         read_task = asyncio.create_task(reader_task(reader))
         write_task = asyncio.create_task(interactive_writer_task(writer))
-        
         await asyncio.gather(read_task, write_task)
-
     except serial_asyncio.serial.SerialException as e:
         print(f"\n{Colors.RED}!!! Chyba sériového portu !!!{Colors.ENDC}")
         print(f"{Colors.RED}Nepodařilo se otevřít port '{SERIAL_PORT}'.{Colors.ENDC}")
@@ -172,7 +170,6 @@ async def main():
         print("  3. Není port používán jiným programem (jako Arduino IDE, Putty, ...).")
         print(f"  4. Máte oprávnění k přístupu k portu (hlavně na Linuxu).{Colors.ENDC}")
         print(f"Systémová chyba: {e}")
-
 
 if __name__ == "__main__":
     print(f"{Colors.CYAN}=== ACS Slave Tester v1.0 ===" + Colors.ENDC)
