@@ -1,0 +1,85 @@
+Koncept: Centralizovaná Řídicí Jednotka
+Master Controller je samostatné zařízení postavené na Raspberry Pi Zero 2 W. Funguje jako centrální mozek operace: přijímá události z "hloupých" slave jednotek (čteček), rozhoduje na základě pravidel v databázi, fyzicky spíná relé pro otevření dveří a poskytuje moderní API pro kompletní správu systému.
+1. Hardwarové komponenty
+Řídicí jednotka: Raspberry Pi Zero 2 W
+Doporučení: Vybavit malým pasivním chladičem (heatsink) pro zajištění stability v 24/7 provozu.
+Úložiště: Vysokokapacitní a odolná MicroSD karta (např. "High Endurance" typ, 32 GB+) pro operační systém, aplikaci a databázi.
+Napájení: Kvalitní 5V / 3A napájecí zdroj (Micro-USB), který zvládne napájet RPi i připojená relé.
+Komunikace se Slaves: Modul "UART to RS-485" (s čipem MAX485), připojený přímo na GPIO piny Raspberry Pi.
+Ovládání zámků: Relé modul s optickou izolací (opto-isolated). Počet kanálů odpovídá počtu ovládaných dveří. Optická izolace chrání citlivé GPIO piny Raspberry Pi.
+Instalace: Všechny komponenty se umístí do instalační krabice na bezpečném místě (např. v serverovně nebo technické místnosti).
+2. Softwarová Architektura (na Raspberry Pi)
+Operační systém: Raspberry Pi OS Lite (64-bit) – bez zbytečného grafického rozhraní pro maximální výkon a spolehlivost.
+Platforma: Python 3.
+Klíčové moduly aplikace:
+CoreLogic: Hlavní smyčka aplikace. Zpracovává události z fronty, volá databázi pro ověření, rozhoduje a iniciuje akce (sepnutí relé, odeslání příkazu slave jednotce).
+DatabaseManager: Třída, která obsluhuje veškerou komunikaci s databází SQLite. Zajišťuje, že zbytek aplikace nemusí řešit SQL dotazy. Vytvoří databázi a tabulky, pokud neexistují.
+SerialCommunicator: Asynchronní (asyncio) modul, který:
+Neustále naslouchá na sériovém portu /dev/serial0.
+Řídí GPIO pin pro přepínání směru RS-485 komunikace.
+Validuje přijaté zprávy (checksum) a vkládá je do fronty pro CoreLogic.
+GpioController: Třída pro bezpečné ovládání GPIO pinů připojených k relé modulu.
+APIServer: Nezávislá služba postavená na frameworku FastAPI. Poskytuje REST API pro vzdálenou správu. Běží pomocí uvicorn.
+3. Databázová Schéma (SQLite)
+Tabulka	Popis	Klíčové sloupce
+Slaves	Fyzické slave jednotky na sběrnici	id, uid (HW adresa), hub_addr, type, description
+Doors	Logické dveře v systému	id, name, slave_id (která čtečka je u dveří), master_relay_pin (GPIO pin na RPi!), open_duration_sec
+Users	Uživatelé systému	id, first_name, last_name, is_active
+Cards	Fyzické karty/čipy	id, card_data (číslo karty), user_id, is_active
+TimeWindows	Časová okna pro přístup	id, name, start_time, end_time, days_of_week
+Permissions	Spojovací tabulka práv	id, user_id, door_id, timewindow_id
+OneTimeCodes	Jednorázové kódy	id, code, door_id, valid_from, valid_to, is_used
+AccessLogs	Log všech událostí	id, timestamp, door_id, user_id, card_data, event_type, access_granted
+4. Základní Workflow (Přístup Povolen)
+Událost: Slave jednotka přečte kartu a odešle zprávu card_read na RS-485 sběrnici.
+Příjem: SerialCommunicator na Masteru zprávu přijme, ověří checksum a předá ji CoreLogic.
+Dotaz do DB: CoreLogic se zeptá DatabaseManager: "Existuje aktivní uživatel s touto aktivní kartou, který má oprávnění pro tyto dveře v tomto čase?"
+Rozhodnutí: DatabaseManager odpoví "Ano".
+Akce (probíhají souběžně):
+CoreLogic -> GpioController: "Aktivuj relé na pinu 17 na 5 sekund."
+CoreLogic -> SerialCommunicator: "Odešli na slave s adresou 5 příkaz feedback_grant."
+Výsledek: Fyzický zámek dveří se odemkne A ZÁROVEŇ slave jednotka pípne a rozsvítí zelenou LED.
+Logování: CoreLogic zapíše do AccessLogs záznam o úspěšném povolení přístupu.
+5. API pro správu (Příklady endpointů)
+GET /api/users - Získá seznam všech uživatelů.
+POST /api/users - Vytvoří nového uživatele.
+PUT /api/cards/{card_data} - Přiřadí kartu k uživateli.
+GET /api/doors/{door_id}/permissions - Zobrazí, kdo má přístup ke dveřím.
+POST /api/doors/{door_id}/permissions - Přidá nové oprávnění pro uživatele.
+GET /api/logs?limit=100 - Získá posledních 100 událostí ze systému.
+POST /api/slaves/discover - Spustí hledání nových, nekonfigurovaných slave jednotek.
+6. Architektonický diagram
+
++------------------------------------------------------+
+| MASTER CONTROLLER (Raspberry Pi Zero 2 W)            |
+| +--------------------------------------------------+ |
+| | Software:                                        | |
+| | +--------------+  +---------------+  +---------+ | |
+| | | Core Logic   |->| DB Manager    |->| SQLite  | | |
+| | | (Python)     |  | (Python)      |  | (soubor)| | |
+| | +------+-------+  +---------------+  +---------+ | |
+| |        |                                         | |
+| |        v                                         | |
+| | +------+-------+  +---------------+             | |
+| | | GPIO Ctrl    |  | API Server    |<--+ (WiFi)  | |
+| | | (RPi.GPIO)   |  | (FastAPI)     |   |         | |
+| | +------+-------+  +---------------+   | Správa  | |
+| |        |                              |         | |
+| +--------|------------------------------|---------+ |
+|          | (GPIO)                       |           |
+|          v                              v           |
+|  +-------+-------+           +----------+---------+ |
+|  | Relé Modul    |           | UART to RS-485     | |
+|  +-------+-------+           | (MAX485)           | |
+|          |                   +----------+---------+ |
++----------|------------------------------|-----------+
+           |                              | (Diferenciální pár A/B)
+           v (Silový kabel k zámku)       |
+      +----+----+                         | RS-485 SBĚRNICE
+      | Zámek 1 |                         |
+      +---------+                         +------------------+------------------+
+                                          |                  |                  |
+                                    +-----v-----+      +-----v-----+      +-----v-----+
+                                    | SLAVE 1   |      | SLAVE 2   |      | SLAVE 3   |
+                                    | (Čtečka)  |      | (Čtečka)  |      | (Čtečka)  |
+                                    +-----------+      +-----------+      +-----------+

@@ -3,6 +3,7 @@
 Testovací skript pro PC, který simuluje Master ACS jednotku.
 - Naslouchá na sériovém portu na zprávy ze Slave modulu.
 - Umožňuje interaktivně odesílat příkazy (grant/deny/identify).
+- Umožňuje měnit adresu Slave zařízení pomocí jejich unikátního ID (UID).
 - Ověřuje funkčnost protokolu a Slave firmwaru.
 """
 
@@ -10,9 +11,10 @@ import asyncio
 import json
 import serial_asyncio
 import sys
+import serial # Potřeba pro výjimku
 
 # --- KONFIGURACE ---
-SERIAL_PORT = "COM5"  # Windows: "COM3", "COM4", atd. | Linux: "/dev/ttyUSB0"
+SERIAL_PORT = "COM6"  # Windows: "COM3", "COM4", atd. | Linux: "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
 # ANSI kódy pro barvy v terminálu pro lepší čitelnost
@@ -22,6 +24,7 @@ class Colors:
     RED = '\033[91m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
     ENDC = '\033[0m'
 
 # --- PROTOKOLOVÉ FUNKCE ---
@@ -81,19 +84,25 @@ async def reader_task(reader):
 
             msg_type = data.get("type")
             hub = data.get("hub_addr")
-            rdr = data.get("rdr_id")
-
+            
             print(f"{Colors.GREEN}IN <---", end=" ")
             if msg_type == "card_read":
-                print(f"CARD_READ | Hub:{hub} | Čtečka:{rdr} | Karta:{data.get('card')} | Bity:{data.get('bits')}{Colors.ENDC}")
+                print(f"CARD_READ | Hub:{hub} | Čtečka:{data.get('rdr_id')} | Karta:{data.get('card')} | Bity:{data.get('bits')}{Colors.ENDC}")
             elif msg_type == "event_rex":
-                print(f"REX EVENT | Hub:{hub} | Dveře:{rdr} | Požadavek na odchod!{Colors.ENDC}")
+                print(f"REX EVENT | Hub:{hub} | Dveře:{data.get('rdr_id')} | Požadavek na odchod!{Colors.ENDC}")
             elif msg_type == "event_door_contact":
-                print(f"DOOR_CONTACT | Hub:{hub} | Dveře:{rdr} | Stav: {data.get('state').upper()}{Colors.ENDC}")
+                print(f"DOOR_CONTACT | Hub:{hub} | Dveře:{data.get('rdr_id')} | Stav: {data.get('state').upper()}{Colors.ENDC}")
             elif msg_type == "heartbeat":
                 print(f"HEARTBEAT | Hub:{hub} | Modul je online.{Colors.ENDC}")
-            elif msg_type in ["nano", "esp32", "rp2040"]:
-                print(f"IDENTIFY | Typ: {msg_type.upper()} | Čteček: {data.get('readers')} | Hub:{hub} | Čtečka:{rdr}{Colors.ENDC}")
+            elif msg_type in ["nano", "esp32", "rp2040"]: # IDENTIFY response
+                print(f"{Colors.MAGENTA}IDENTIFY | Typ: {msg_type.upper()} | UID: {data.get('uid')} | Hub:{hub} | Čteček: {data.get('readers')}{Colors.ENDC}")
+            elif msg_type == "ack_set_address":
+                if data.get("status") == "success":
+                    print(f"{Colors.MAGENTA}ADDRESS SET OK | UID: {data.get('uid')} | Nová adresa: {data.get('new_addr')}{Colors.ENDC}")
+                else:
+                    print(f"{Colors.RED}ADDRESS SET FAIL | UID: {data.get('uid')} | Důvod: {data.get('reason')}{Colors.ENDC}")
+            elif msg_type == "boot":
+                 print(f"{Colors.CYAN}BOOT | Zařízení hlásí: {data.get('msg')} | {data}{Colors.ENDC}")
             else:
                 print(f"{Colors.YELLOW}Neznámý typ zprávy: {data}{Colors.ENDC}")
 
@@ -109,7 +118,8 @@ async def interactive_writer_task(writer):
         print("\n" + Colors.BLUE + "Dostupné příkazy:" + Colors.ENDC)
         print(" [1] Povolit přístup (grant)")
         print(" [2] Zamítnout přístup (deny)")
-        print(" [3] Identifikovat zařízení (identify)")
+        print(" [3] Identifikovat všechna zařízení (broadcast)")
+        print(" [4] Změnit adresu slave zařízení (přes UID)")
         print(" [q] Ukončit")
 
         choice = await loop.run_in_executor(None, sys.stdin.readline)
@@ -118,39 +128,56 @@ async def interactive_writer_task(writer):
         if choice == 'q':
             break
 
-        if choice in ['1', '2', '3']:
+        payload = None
+        if choice == '3':
+            # Identify je broadcast, hub_addr je irelevantní (může být 0)
+            payload = {"type": "command", "cmd": "identify", "hub_addr": 0}
+
+        elif choice == '4':
+            try:
+                target_uid = await loop.run_in_executor(None, lambda: input("  Zadej UID cílového zařízení: "))
+                new_addr_str = await loop.run_in_executor(None, lambda: input(f"  Zadej novou adresu pro {target_uid.strip().upper()}: "))
+                new_addr = int(new_addr_str)
+
+                payload = {
+                    "type": "command",
+                    "cmd": "set_address",
+                    "target_uid": target_uid.strip().upper(),
+                    "new_addr": new_addr
+                }
+            except (ValueError, TypeError):
+                print(f"{Colors.RED}Neplatný vstup, zadejte prosím platné hodnoty.{Colors.ENDC}")
+            except Exception as e:
+                print(f"{Colors.RED}Chyba: {e}{Colors.ENDC}")
+        
+        elif choice in ['1', '2']:
             try:
                 hub_addr_str = await loop.run_in_executor(None, lambda: input("  Zadej adresu HUBu (např. 1): "))
                 rdr_id_str = await loop.run_in_executor(None, lambda: input("  Zadej ID dveří/čtečky (např. 1): "))
                 hub_addr = int(hub_addr_str)
                 rdr_id = int(rdr_id_str)
 
-                if choice == '1':
-                    cmd = "feedback_grant"
-                elif choice == '2':
-                    cmd = "feedback_deny"
-                elif choice == '3':
-                    cmd = "identify"
-
+                cmd = "feedback_grant" if choice == '1' else "feedback_deny"
+                
                 payload = {
                     "type": "command",
                     "hub_addr": hub_addr,
                     "cmd": cmd,
                     "rdr_id": rdr_id
                 }
-
-                message = create_message(payload)
-                if message:
-                    print(f"{Colors.YELLOW}OUT ---> Posílám: {message.strip()}{Colors.ENDC}")
-                    writer.write(message.encode('utf-8'))
-                    await writer.drain()
-
             except (ValueError, TypeError):
                 print(f"{Colors.RED}Neplatný vstup, zadejte prosím čísla.{Colors.ENDC}")
             except Exception as e:
-                print(f"{Colors.RED}Chyba při odesílání: {e}{Colors.ENDC}")
+                print(f"{Colors.RED}Chyba: {e}{Colors.ENDC}")
         else:
             print(f"{Colors.RED}Neznámá volba.{Colors.ENDC}")
+
+        if payload:
+            message = create_message(payload)
+            if message:
+                print(f"{Colors.YELLOW}OUT ---> Posílám: {message.strip()}{Colors.ENDC}")
+                writer.write(message.encode('utf-8'))
+                await writer.drain()
     
     asyncio.get_event_loop().stop()
 
@@ -161,7 +188,7 @@ async def main():
         read_task = asyncio.create_task(reader_task(reader))
         write_task = asyncio.create_task(interactive_writer_task(writer))
         await asyncio.gather(read_task, write_task)
-    except serial_asyncio.serial.SerialException as e:
+    except serial.SerialException as e:
         print(f"\n{Colors.RED}!!! Chyba sériového portu !!!{Colors.ENDC}")
         print(f"{Colors.RED}Nepodařilo se otevřít port '{SERIAL_PORT}'.{Colors.ENDC}")
         print(f"{Colors.YELLOW}Zkontrolujte, zda:")
@@ -172,12 +199,13 @@ async def main():
         print(f"Systémová chyba: {e}")
 
 if __name__ == "__main__":
-    print(f"{Colors.CYAN}=== ACS Slave Tester v1.0 ===" + Colors.ENDC)
+    print(f"{Colors.CYAN}=== ACS Slave Tester v2.0 (s podporou UID) ===" + Colors.ENDC)
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\nUkončuji...")
     finally:
-        loop.close()
+        if not loop.is_closed():
+            loop.close()
     print("Program byl ukončen.")
