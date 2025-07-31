@@ -12,7 +12,7 @@
 
 // !!! DŮLEŽITÉ: TOTO ID ZMĚŇTE PRO KAŽDÝ KUS HARDWARU !!!
 // Můžete použít generátor hesel nebo GUID pro inspiraci.
-#define UNIQUE_ID "NANO-2A4B-C5D6-E7F8" 
+#define UNIQUE_ID "NANO-2A4B-C5D6-E7F8"
 
 // Adresy v EEPROM pro uložení adresy sběrnice
 #define EEPROM_ADDR_MAGIC 0
@@ -93,10 +93,20 @@ void sendCardReadMessage(uint32_t cardCode, byte bits) {
 }
 
 bool checkParity(uint32_t code, byte bits) {
-  if (bits != 26) return true;
-  uint32_t first13 = (code >> 13) & 0x1FFF;
-  uint32_t last13 = code & 0x1FFF;
-  return (__builtin_popcount(first13) % 2 == 0) && (__builtin_popcount(last13) % 2 == 1);
+  return true;
+//  if (bits != 26) return true;
+//
+//  byte parity1 = (code >> 25) & 0x01;      // Bit 25 (levá parita)
+//  byte parity2 = code & 0x01;              // Bit 0 (pravá parita)
+//  uint32_t data = (code >> 1) & 0x00FFFFFF; // Odstraníme levý i pravý paritní bit
+//
+//  uint32_t first13 = (data >> 13) & 0x1FFF;
+//  uint32_t last13 = data & 0x1FFF;
+//
+//  bool expectedP1 = (__builtin_popcount(first13) % 2 == 0);
+//  bool expectedP2 = (__builtin_popcount(last13) % 2 == 1);
+//
+//  return (parity1 == expectedP1) && (parity2 == expectedP2);
 }
 
 void handleCommand(const String& payload) {
@@ -120,23 +130,23 @@ void handleCommand(const String& payload) {
       ackDoc["uid"] = UNIQUE_ID;
       ackDoc["new_addr"] = newAddr;
       sendJsonMessage(ackDoc);
-      
+
       delay(100); // Dát čas na odeslání odpovědi
       void(*resetFunc)(void) = 0; // Deklarace ukazatele na reset funkci
       resetFunc(); // Reset Arduina pro aplikaci nové adresy
     }
     return;
   }
-  
+
   // Příkaz identify je také speciální - reaguje vždy
   if (type == "command" && cmd == "identify") {
-      StaticJsonDocument<128> responseDoc;
-      responseDoc["type"] = "nano";
-      responseDoc["uid"] = UNIQUE_ID;
-      responseDoc["hub_addr"] = hubAddress;
-      responseDoc["readers"] = 1;
-      sendJsonMessage(responseDoc);
-      return;
+    StaticJsonDocument<128> responseDoc;
+    responseDoc["type"] = "nano";
+    responseDoc["uid"] = UNIQUE_ID;
+    responseDoc["hub_addr"] = hubAddress;
+    responseDoc["readers"] = 1;
+    sendJsonMessage(responseDoc);
+    return;
   }
 
   // Ostatní příkazy se zpracují, jen pokud sedí adresa (a není 0)
@@ -192,7 +202,9 @@ void updateFeedback() {
 // --- HLAVNÍ FUNKCE ---
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); }
+  while (!Serial) {
+    delay(10);
+  }
 
   loadAddressFromEEPROM();
 
@@ -204,7 +216,7 @@ void setup() {
   digitalWrite(BUZZER, LOW);
 
   wg.begin(D0_PIN, D1_PIN);
-  
+
   StaticJsonDocument<128> bootMsg;
   bootMsg["type"] = "boot";
   bootMsg["msg"] = "ACS Nano ready";
@@ -214,7 +226,7 @@ void setup() {
 
 void loop() {
   unsigned long currentMillis = millis();
-  
+
   if (wg.available()) {
     if (checkParity(wg.getCode(), wg.getWiegandType())) {
       sendCardReadMessage(wg.getCode(), wg.getWiegandType());
@@ -224,6 +236,7 @@ void loop() {
       errDoc["hub_addr"] = hubAddress;
       errDoc["rdr_id"] = 1;
       errDoc["error"] = "parity";
+      errDoc["card"] = wg.getCode(),
       sendJsonMessage(errDoc);
     }
   }
@@ -247,7 +260,9 @@ void loop() {
       }
       inputBuffer = "";
     } else {
-      if (inputBuffer.length() < 256) { inputBuffer += c; }
+      if (inputBuffer.length() < 256) {
+        inputBuffer += c;
+      }
     }
   }
 
