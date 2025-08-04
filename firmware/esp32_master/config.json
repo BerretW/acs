@@ -1,0 +1,22 @@
+{
+    "I2C_BUS": {
+        "id": 0,
+        "scl_pin": 22,
+        "sda_pin": 21,
+        "freq": 100000
+    },
+    "SLAVES": [
+        {
+            "id": 1,
+            "name": "Nano - Dilna",
+            "uid": "NANO-2A4B-C5D6-E7F8",
+            "final_address": 16
+        },
+        {
+            "id": 2,
+            "name": "ESP32 - Sklad",
+            "uid": "VLOZTE_UID_VASEHO_ESP32_SLAVE",
+            "final_address": 17
+        }
+    ]
+}

@@ -1,249 +1,255 @@
-# firmware/rp2040/main.py
-"""
-Firmware pro ACS Slave modul postavený na Raspberry Pi Pico (RP2040).
-- Založeno na robustní asynchronní verzi pro ESP32.
-- Podporuje až 4 čtečky/dveře ve výchozí konfiguraci.
-- Ukládá konfigurovatelnou adresu do souboru ve flash paměti.
-- Identifikuje se pomocí unikátního hardwarového ID čipu.
-"""
-
 import uasyncio
-from machine import Pin, UART, unique_id, reset
+from machine import Pin, I2C, unique_id, reset
 import ujson
 import ubinascii
 import micropython
+import struct
+import utime
 
-# Lokální knihovny (musí být nahrány na RP2040)
-import protocol
+# Lokální knihovny
 from pro_wiegand_lib import WiegandController
 
-micropython.alloc_emergency_exception_buf(100)
+micropython.alloc_emergency_exception_buf(200)
 
 # --- KONFIGURACE A GLOBÁLNÍ PROMĚNNÉ ---
 CONFIG_FILE = 'config.json'
-UNIQUE_ID = ubinascii.hexlify(unique_id()).decode('utf-8').upper()
-
-# Defaultní konfigurace, pokud soubor neexistuje
-DEFAULT_CONFIG = {
-    "HUB_ADDRESS": 0,  # Adresa 0 znamená "nekonfigurováno", čeká na přiřazení
-    "UART_BUS": {
-        "id": 0, # UART0 na RP2040
-        "baudrate": 115200,
-        "tx_pin": 0, # GP0
-        "rx_pin": 1  # GP1
-    },
-    "DOORS": [
-        {
-            "id": 1, "name": "Dvere 1", "d0_pin": 2, "d1_pin": 3,
-            "gled_pin": 4, "rled_pin": 5, "buzz_pin": 6,
-            "rex_pin": 7, "contact_pin": 8
-        },
-        {
-            "id": 2, "name": "Dvere 2", "d0_pin": 9, "d1_pin": 10,
-            "gled_pin": 11, "rled_pin": 12, "buzz_pin": 13,
-            "rex_pin": 14, "contact_pin": 15
-        },
-        {
-            "id": 3, "name": "Dvere 3", "d0_pin": 16, "d1_pin": 17,
-            "gled_pin": 18, "rled_pin": 19, "buzz_pin": 20,
-            "rex_pin": 21, "contact_pin": 22
-        },
-        {
-            # Poznámka: Piny 23, 24, 25, 29 mají na desce Pico W speciální funkce,
-            # ale na standardním Pico jsou to běžné GPIO. Na Pico W by měly
-            # fungovat, pokud nepoužíváte WiFi/BT. GP25 je palubní LED.
-            "id": 4, "name": "Dvere 4", "d0_pin": 26, "d1_pin": 27,
-            "gled_pin": 28, "rled_pin": 25, "buzz_pin": 24,
-            "rex_pin": 23, "contact_pin": 29
-        }
-    ]
-}
+ADDR_FILE = 'i2c_addr.dat'
+HW_UNIQUE_ID = ubinascii.hexlify(unique_id()).decode('utf-8').upper()
 CONFIG = {}
+UNIQUE_ID = ""
 
-message_queue = []
+# I2C a fronta pro odchozí zprávy
+i2c = None
+i2c_address = 0
+tx_queue = [] # Fronta binárních zpráv pro Mastera
+
+# Slovníky pro piny
 feedback_pins = {}
 input_pins = {}
 last_input_states = {}
 
-# --- FUNKCE PRO PRÁCI S KONFIGURACÍ ---
+# --- JEDNOTNÝ BINÁRNÍ PROTOKOL ---
+UNCONFIGURED_I2C_ADDRESS = 0x08
+# Příkazy od Mastera
+CMD_IDENTIFY          = 0x01
+CMD_SET_ADDRESS       = 0x02
+CMD_FEEDBACK_GRANT    = 0x10
+CMD_FEEDBACK_DENY     = 0x11
+# Zprávy od Slave
+RESP_IDENTIFY         = 0x41
+ACK_SET_ADDRESS       = 0x42
+EVENT_CARD_READ       = 0x81
+EVENT_HEARTBEAT       = 0x82
+EVENT_REX             = 0x83
+EVENT_DOOR_CONTACT    = 0x84
+STATUS_OK             = 0x01
+
+
+# --- LADÍCÍ FUNKCE ---
+def print_hex_buffer(data):
+    """Vypíše bytes objekt v HEX formátu."""
+    print(' '.join(['{:02X}'.format(b) for b in data]))
+
+# --- FUNKCE PRO PRÁCI S ADRESOU A PROTOKOLEM ---
+# (Tyto funkce jsou identické s verzí pro ESP32)
 def load_config():
-    global CONFIG
+    global CONFIG, UNIQUE_ID
     try:
         with open(CONFIG_FILE, 'r') as f:
-            loaded_data = ujson.load(f)
-        if not isinstance(loaded_data, dict):
-            raise TypeError("Konfigurace neni slovnik (dict)")
-        CONFIG = loaded_data
-        print(f"Konfigurace načtena, adresa sběrnice: {CONFIG.get('HUB_ADDRESS')}")
-    except (OSError, ValueError, TypeError) as e:
-        print(f"Info: Konfig. soubor nenalezen/poškozen ({e}), používám a ukládám defaultní.")
-        CONFIG = DEFAULT_CONFIG
-        save_config()
+            CONFIG = ujson.load(f)
+        UNIQUE_ID = CONFIG.get("UNIQUE_ID_OVERRIDE") or HW_UNIQUE_ID
+        print(f"[DBG] Konfigurace načtena. UID: {UNIQUE_ID}")
+    except (OSError, ValueError):
+        print("[DBG] Konfigurační soubor nenalezen/poškozen. Používám hardwarové UID.")
+        CONFIG = {"DOORS": []}
+        UNIQUE_ID = HW_UNIQUE_ID
 
-def save_config():
+def load_address():
+    global i2c_address
     try:
-        with open(CONFIG_FILE, 'w') as f:
-            ujson.dump(CONFIG, f)
-        print(f"Konfigurace uložena. Nová adresa: {CONFIG.get('HUB_ADDRESS')}")
+        with open(ADDR_FILE, 'rb') as f:
+            addr_bytes = f.read()
+            if len(addr_bytes) == 1:
+                i2c_address = addr_bytes[0]
+                print(f"[DBG] I2C adresa načtena ze souboru: {i2c_address} (0x{i2c_address:X})")
+                return
+    except OSError:
+        pass
+    i2c_address = UNCONFIGURED_I2C_ADDRESS
+    print(f"[DBG] Platná adresa nenalezena, používám defaultní: {i2c_address} (0x{i2c_address:X})")
+
+def save_address(new_addr):
+    print(f"[DBG] Ukládám novou adresu {new_addr} do souboru.")
+    try:
+        with open(ADDR_FILE, 'wb') as f:
+            f.write(bytes([new_addr]))
+        print(f"[DBG] Nová I2C adresa {new_addr} uložena.")
     except OSError as e:
-        print(f"CHYBA: Nepodařilo se uložit konfiguraci: {e}")
+        print(f"CHYBA: Nepodařilo se uložit adresu: {e}")
 
-# --- CALLBACKY A ASYNCHRONNÍ ÚLOHY ---
-# Tyto funkce jsou identické s verzí pro ESP32.
+def calculate_checksum(data):
+    checksum = 0
+    for byte in data: checksum ^= byte
+    return checksum
 
-def wiegand_callback(data_tuple):
-    hub_addr = CONFIG.get("HUB_ADDRESS", 0)
-    if hub_addr == 0: return
-
-    reader_id, card_data, bits = data_tuple
-    payload = {
-        "type": "card_read", "hub_addr": hub_addr, "rdr_id": reader_id,
-        "card": card_data, "bits": bits
-    }
-    message_queue.append(protocol.create_message(payload))
-
-async def sender_task(writer):
-    print("Sender task spuštěn.")
-    while True:
-        if message_queue:
-            message = message_queue.pop(0)
-            writer.write(message.encode('utf-8'))
-            await writer.drain()
-        await uasyncio.sleep_ms(20)
-
-async def command_listener(reader):
-    print("Command listener spuštěn.")
-    while True:
-        raw_line = await reader.readline()
-        if not raw_line: continue
-        
-        parsed_data = protocol.parse_message(raw_line.decode('utf-8'))
-        if not parsed_data: continue
-
-        cmd_type = parsed_data.get('type')
-        hub_addr = CONFIG.get("HUB_ADDRESS", 0)
-
-        if cmd_type == 'command' and parsed_data.get('cmd') == 'set_address':
-            if parsed_data.get('target_uid') == UNIQUE_ID:
-                new_addr = parsed_data.get('new_addr')
-                CONFIG['HUB_ADDRESS'] = new_addr
-                save_config()
-                
-                ack_payload = {"type": "ack_set_address", "status": "success", "uid": UNIQUE_ID, "new_addr": new_addr}
-                message_queue.append(protocol.create_message(ack_payload))
-                
-                await uasyncio.sleep(1)
-                reset()
-            continue
-
-        if cmd_type == 'command' and parsed_data.get('cmd') == 'identify':
-            ident_payload = {
-                "type": "rp2040", # Identifikace typu zařízení
-                "uid": UNIQUE_ID, 
-                "hub_addr": hub_addr,
-                "readers": len(CONFIG.get("DOORS", []))
-            }
-            message_queue.append(protocol.create_message(ident_payload))
-            continue
-
-        if hub_addr == 0 or parsed_data.get('hub_addr') != hub_addr:
-            continue
-        
-        if cmd_type == 'command':
-            uasyncio.create_task(handle_feedback_command(parsed_data))
-
-async def handle_feedback_command(cmd_data):
-    rdr_id = cmd_data.get('rdr_id')
-    cmd = cmd_data.get('cmd')
-    pins = feedback_pins.get(rdr_id)
-    if not pins: return
+def prepare_message(payload):
+    if len(tx_queue) > 20: 
+        print("[DBG] VAROVÁNÍ: Fronta pro odeslani je plna, zprava zahozena!")
+        return
     
-    if cmd == "feedback_grant":
-        pins['gled'].on(); pins['rled'].off(); pins['buzz'].on()
-        await uasyncio.sleep_ms(250)
-        pins['buzz'].off()
-        await uasyncio.sleep_ms(1500)
-        pins['gled'].off()
-    elif cmd == "feedback_deny":
-        pins['gled'].off(); pins['rled'].on(); pins['buzz'].on()
-        await uasyncio.sleep_ms(150)
-        pins['buzz'].off()
-        await uasyncio.sleep_ms(100)
-        pins['buzz'].on()
-        await uasyncio.sleep_ms(150)
-        pins['buzz'].off()
-        await uasyncio.sleep_ms(1500)
-        pins['rled'].off()
+    checksum = calculate_checksum(payload)
+    message = payload + bytes([checksum])
+    tx_queue.append(message)
+    print(f"[DBG] Pripravena zprava k odeslani ({len(message)} bytu): ", end="")
+    print_hex_buffer(message)
 
-async def monitor_inputs():
-    print("Monitoring vstupů spuštěn.")
+# --- CALLBACKY A PŘÍPRAVA ZPRÁV ---
+def wiegand_callback(data_tuple):
+    if i2c_address == UNCONFIGURED_I2C_ADDRESS: return
+    rdr_id, card_data, bits = data_tuple
+    print(f"[EVT] Wiegand data prijata - Rdr: {rdr_id}, Kod: {card_data}, Bity: {bits}")
+    payload = struct.pack('>BBBB_I', EVENT_CARD_READ, 6, rdr_id, bits, card_data)
+    prepare_message(payload)
+
+def handle_i2c_command(data):
+    print(f"[I2C] Prijat prikaz od Mastera ({len(data)} bytu): ", end="")
+    print_hex_buffer(data)
+
+    if not data: return
+    cmd = data[0]
+    
+    if cmd == CMD_IDENTIFY:
+        print(f"  -> Prikaz: IDENTIFY (0x{cmd:02X})")
+        payload = bytes([RESP_IDENTIFY, len(UNIQUE_ID)]) + UNIQUE_ID.encode()
+        prepare_message(payload)
+
+    elif cmd == CMD_SET_ADDRESS and len(data) > 1:
+        new_addr = data[1]
+        print(f"  -> Prikaz: SET_ADDRESS (0x{cmd:02X}) na 0x{new_addr:X}")
+        save_address(new_addr)
+        payload = struct.pack('>BBBB', ACK_SET_ADDRESS, 2, STATUS_OK, new_addr)
+        prepare_message(payload)
+        
+        async def do_reset():
+            print("[DBG] Restart za 1 sekundu pro aplikovani nove adresy...")
+            await uasyncio.sleep(1)
+            reset()
+        uasyncio.create_task(do_reset())
+
+    elif (cmd == CMD_FEEDBACK_GRANT or cmd == CMD_FEEDBACK_DENY) and len(data) > 1:
+        rdr_id = data[1]
+        cmd_name = "GRANT" if cmd == CMD_FEEDBACK_GRANT else "DENY"
+        print(f"  -> Prikaz: FEEDBACK_{cmd_name} (0x{cmd:02X}) pro rdr_id {rdr_id}")
+        uasyncio.create_task(handle_feedback_command(rdr_id, cmd))
+    
+    else:
+        print(f"  -> Prikaz: NEZNAMY (0x{cmd:02X})")
+
+# DŮLEŽITÁ ZMĚNA: Toto je místo, kde se liší RP2040 a ESP32
+# Na RP2040 není IRQ, proto musíme vytvořit polling task
+async def i2c_polling_task():
+    print("[DBG] I2C polling task spuštěn.")
     while True:
-        hub_addr = CONFIG.get("HUB_ADDRESS", 0)
-        if hub_addr != 0:
+        try:
+            # Čekání na příchozí data (simulace blokujícího čtení)
+            # V reálném PIO slave by to bylo neblokující
+            if i2c.any_write(): # Hypotetická funkce PIO knihovny
+                data = i2c.read_data() # Hypotetická funkce
+                handle_i2c_command(data)
+
+            # Odeslání dat, pokud si je Master žádá
+            if i2c.is_read_pending(): # Hypotetická funkce
+                if tx_queue:
+                    message_to_send = tx_queue.pop(0)
+                    i2c.write_data(message_to_send) # Hypotetická funkce
+                else:
+                    i2c.write_data(b'\x00')
+
+        except Exception as e:
+            # I2C Polling by neměl padat, ale pro jistotu
+            print(f"CHYBA v I2C Polling Task: {e}")
+        
+        await uasyncio.sleep_ms(10) # Často se dotazujeme
+
+
+# --- ASYNCHRONNÍ ÚLOHY ---
+# (Tyto úlohy jsou identické s verzí pro ESP32)
+async def monitor_inputs():
+    while True:
+        if i2c_address != UNCONFIGURED_I2C_ADDRESS:
             for door in CONFIG.get("DOORS", []):
                 rdr_id = door["id"]
                 pins = input_pins[rdr_id]
                 
                 if pins['rex'].value() == 0 and last_input_states.get((rdr_id, 'rex'), 1) == 1:
-                    payload = {"type": "event_rex", "hub_addr": hub_addr, "rdr_id": rdr_id}
-                    message_queue.append(protocol.create_message(payload))
+                    print(f"[EVT] Stisknuto REX tlacitko na dverich ID: {rdr_id}")
+                    payload = struct.pack('>BBB', EVENT_REX, 1, rdr_id)
+                    prepare_message(payload)
                 last_input_states[(rdr_id, 'rex')] = pins['rex'].value()
 
                 contact_val = pins['contact'].value()
                 if contact_val != last_input_states.get((rdr_id, 'contact'), -1):
-                    state = "open" if contact_val == 1 else "closed"
-                    payload = {"type": "event_door_contact", "hub_addr": hub_addr, "rdr_id": rdr_id, "state": state}
-                    message_queue.append(protocol.create_message(payload))
+                    state = 1 if contact_val == 1 else 0
+                    state_str = "otevren" if state == 1 else "zavren"
+                    print(f"[EVT] Zmena stavu dverniho kontaktu ID: {rdr_id} -> {state_str}")
+                    payload = struct.pack('>BBBB', EVENT_DOOR_CONTACT, 2, rdr_id, state)
+                    prepare_message(payload)
                 last_input_states[(rdr_id, 'contact')] = contact_val
         await uasyncio.sleep_ms(50)
 
 async def heartbeat():
-    print("Heartbeat task spuštěn.")
     while True:
         await uasyncio.sleep(30)
-        hub_addr = CONFIG.get("HUB_ADDRESS", 0)
-        if hub_addr != 0:
-            payload = {"type": "heartbeat", "hub_addr": hub_addr}
-            message_queue.append(protocol.create_message(payload))
+        if i2c_address != UNCONFIGURED_I2C_ADDRESS:
+            print("[DBG] Cas na Heartbeat.")
+            payload = struct.pack('>BB', EVENT_HEARTBEAT, 0)
+            prepare_message(payload)
+
+async def handle_feedback_command(rdr_id, cmd_type):
+    pins = feedback_pins.get(rdr_id)
+    if not pins: return
+    cmd_name = "GRANT" if cmd_type == CMD_FEEDBACK_GRANT else "DENY"
+    print(f"[DBG] Spoustim zpetnou vazbu (Feedback) -> {cmd_name} pro rdr_id {rdr_id}")
+    if cmd_type == CMD_FEEDBACK_GRANT:
+        pins['gled'].on(); pins['rled'].off(); pins['buzz'].on()
+        await uasyncio.sleep_ms(250); pins['buzz'].off(); await uasyncio.sleep_ms(1500); pins['gled'].off()
+    elif cmd_type == CMD_FEEDBACK_DENY:
+        pins['gled'].off(); pins['rled'].on(); pins['buzz'].on()
+        await uasyncio.sleep_ms(150); pins['buzz'].off()
+        await uasyncio.sleep_ms(100); pins['buzz'].on()
+        await uasyncio.sleep_ms(150); pins['buzz'].off()
+        await uasyncio.sleep_ms(1500); pins['rled'].off()
+    print(f"[DBG] Dokoncena zpetna vazba (Feedback) pro rdr_id {rdr_id}")
 
 async def main():
-    print(f"--- ACS Slave Modul (RP2040) ---")
-    print(f"Unikátní ID (UID): {UNIQUE_ID}")
-    
+    print(f"\n--- ACS I2C Slave Modul (RP2040) ---")
     load_config()
+    load_address()
     
     wiegand_configs = []
     for door in CONFIG.get("DOORS", []):
         d_id = door["id"]
         wiegand_configs.append({'id': d_id, 'd0_pin': door['d0_pin'], 'd1_pin': door['d1_pin']})
-        feedback_pins[d_id] = {
-            'gled': Pin(door['gled_pin'], Pin.OUT, value=0),
-            'rled': Pin(door['rled_pin'], Pin.OUT, value=0),
-            'buzz': Pin(door['buzz_pin'], Pin.OUT, value=0)
-        }
-        input_pins[d_id] = {
-            'rex': Pin(door['rex_pin'], Pin.IN, Pin.PULL_UP),
-            'contact': Pin(door['contact_pin'], Pin.IN, Pin.PULL_UP)
-        }
-        print(f"Dveře ID:{d_id} ({door.get('name', '')}) nakonfigurovány na pinech D0/D1: {door['d0_pin']}/{door['d1_pin']}.")
-
+        feedback_pins[d_id] = {'gled': Pin(door['gled_pin'], Pin.OUT, value=0),'rled': Pin(door['rled_pin'], Pin.OUT, value=0),'buzz': Pin(door['buzz_pin'], Pin.OUT, value=0)}
+        input_pins[d_id] = {'rex': Pin(door['rex_pin'], Pin.IN, Pin.PULL_UP),'contact': Pin(door['contact_pin'], Pin.IN, Pin.PULL_UP)}
+        print(f"[DBG] Dvere ID:{d_id} ({door.get('name', 'N/A')}) nakonfigurovány.")
     WiegandController(wiegand_configs, wiegand_callback)
 
-    uart_cfg = CONFIG["UART_BUS"]
-    bus = UART(uart_cfg["id"], baudrate=uart_cfg["baudrate"], tx=Pin(uart_cfg["tx_pin"]), rx=Pin(uart_cfg["rx_pin"]))
-    
-    reader = uasyncio.StreamReader(bus)
-    writer = uasyncio.StreamWriter(bus, {})
+    # Zde by byla inicializace PIO I2C Slave
+    # Protože neexistuje standardní knihovna, tato část je hypotetická
+    # global i2c
+    # i2c = I2CSlave(0, scl_pin=1, sda_pin=0, slave_address=i2c_address)
+    print("CHYBA: Standardni machine.I2C na RP2040 nepodporuje slave mod.")
+    print("       Pro plnou funkcionalitu je potreba specialni PIO knihovna.")
 
-    uasyncio.create_task(sender_task(writer))
-    uasyncio.create_task(command_listener(reader))
+
+    # Spuštění asynchronních úloh
+    # uasyncio.create_task(i2c_polling_task()) # Tento task by nahradil IRQ
     uasyncio.create_task(monitor_inputs())
     uasyncio.create_task(heartbeat())
     
-    print("--- Systém je plně funkční ---")
-    
-    while True:
-        await uasyncio.sleep(3600)
+    print(f"--- System bezi (v omezene kapacite bez I2C slave) ---")
+    while True: await uasyncio.sleep(3600)
 
 try:
     uasyncio.run(main())
@@ -251,5 +257,5 @@ except KeyboardInterrupt:
     print("Program ukončen.")
     reset()
 except Exception as e:
-    print(f"Neocekavana chyba na nejvyssi urovni: {e}")
+    print(f"FATÁLNÍ CHYBA: {e}")
     reset()
